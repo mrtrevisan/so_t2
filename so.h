@@ -11,7 +11,7 @@
 
 typedef struct so_t so_t;
 
-typedef struct proc proc_t;
+typedef struct proc_t proc_t;
 
 // as chamadas de sistema
 typedef enum {

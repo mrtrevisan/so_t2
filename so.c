@@ -2,17 +2,7 @@
 #include "tela.h"
 #include <stdlib.h>
 
-struct so_t {
-  contr_t *contr;       // o controlador do hardware
-  bool paniquei;        // apareceu alguma situação intratável
-  cpu_estado_t *cpue;   // cópia do estado da CPU
-
-  proc_t* proc_exec;   // ponteiro pro processo atual
-  proc_t* proc_bloq;    // inicio da fila de processos bloqueados
-  proc_t* proc_prt;     // inicio da fila de processos prontos
-};
-
-struct proc
+struct proc_t
 {
   int id_proc;             // id do processo
   cpu_estado_t *cpue_proc; // estado da cpu do processo
@@ -21,8 +11,24 @@ struct proc
 
   proc_bloq_t motivo_bloq;    // pq bloqueou
   int disp_bloq;              // qual disp bloqueou
+
+  float tempo_expect;       //tempo esperado da próxima execução
+  float tempo_exec;         //tempo que passou executando
   
   proc_t* prox;
+};
+
+struct so_t {
+  contr_t *contr;       // o controlador do hardware
+  bool paniquei;        // apareceu alguma situação intratável
+  cpu_estado_t *cpue;   // cópia do estado da CPU
+
+  proc_t* proc_exec;    // ponteiro pro processo atual
+  proc_t* proc_bloq;    // inicio da fila de processos bloqueados
+  proc_t* proc_prt;     // inicio da fila de processos prontos
+
+  int quantum;                        //quantum
+  int (*esc_ptr) (so_t*, proc_t**);  //ponteiro para o escalonador 
 };
 
 // funções auxiliares
@@ -71,8 +77,35 @@ err_t restaura_contexto_proc(so_t* self, proc_t* proc){
   return ERR_OK;
 }
 
-int escalonador(so_t *self, proc_t** novo)
+int escalonador_curto(so_t *self, proc_t** novo){
+  //debug
+  t_printf("Chamado escalonador mais curto");
+  proc_t* aux = self->proc_prt;
+
+  if (self->proc_prt == NULL){      //todos os processos estão bloqueados... ou
+    if (self->proc_bloq == NULL){   //acabaram os processos
+      return -1;
+    }  
+    return 0;
+  }
+  else {                //tem pelo menos 1 processo pronto
+    *novo = aux;
+    while(aux->prox != NULL) {
+      if (aux->tempo_expect < (*novo)->tempo_expect){ 
+        //achou um mais curto
+        *novo = aux;
+      }
+      aux = aux->prox;
+    }
+    return 1;
+  }
+}
+
+int escalonador_round(so_t *self, proc_t** novo)
 {
+  //debug
+  t_printf("Chamado escalonador circular");
+
   if (self->proc_prt == NULL){      //todos os processos estão bloqueados... ou
     if (self->proc_bloq == NULL){   //acabaram os processos
       return -1;
@@ -87,7 +120,7 @@ int escalonador(so_t *self, proc_t** novo)
 
 void troca_processo(so_t* self){
   proc_t* novo = NULL;
-  int esc = escalonador(self, &novo);
+  int esc = (*(self->esc_ptr))(self, &novo);
 
   //debug
 /*
@@ -174,8 +207,13 @@ proc_t* novo_proc(so_t* self, int id)
   
   novo->cpue_proc = cpue_cria();
   novo->mem_proc = mem_cria(MEM_TAM);
+
   novo->id_proc = id;
   novo->est_proc = PRONTO;
+
+  novo->tempo_expect = self->quantum;
+  novo->tempo_exec = 0.0;
+
   novo->prox = NULL;
 
   return novo;
@@ -183,9 +221,13 @@ proc_t* novo_proc(so_t* self, int id)
 
 void bloqueia_proc(so_t* self, proc_bloq_t motivo, int disp){
   t_printf("Bloqueando proc %d", self->proc_exec->id_proc);
-  self->proc_exec->est_proc = BLOQ;
-  self->proc_exec->motivo_bloq = motivo;
-  self->proc_exec->disp_bloq = disp;
+  self->proc_exec->est_proc = BLOQ;     
+  self->proc_exec->motivo_bloq = motivo;    //guarda o motivo do bloqueio
+  self->proc_exec->disp_bloq = disp;        //guarda qual disp bloqueou
+
+  self->proc_exec->tempo_expect += self->proc_exec->tempo_exec;
+  self->proc_exec->tempo_expect /= 2;
+  self->proc_exec->tempo_exec = 0.0;          //zera o tempo em que executou
 
   proc_t* aux = self->proc_bloq;
   if (aux == NULL) {                        //fila de bloqueados esta vazia
@@ -222,6 +264,14 @@ so_t *so_cria(contr_t *contr)
   self->proc_bloq = NULL;
   self->proc_prt = novo_proc(self, 0);
   self->proc_exec = self->proc_prt;
+
+  //aqui escolhe entre um quantum grande e um pequeno
+  self->quantum = 15;      //quantum grande
+  //self->quantum = 6;       //quantum pequeno
+
+  //aqui escolhe qual escalonador será usado
+  //self->esc_ptr = &escalonador_round;     //escalonador circular
+  self->esc_ptr = &escalonador_curto;     //escalonador que escolhe o mais rápido
 
   init_mem(self);
   // coloca a CPU em modo usuário
@@ -379,24 +429,28 @@ static void so_trata_sisop(so_t *self)
 static void so_trata_tic(so_t *self)
 {
   //debug
-  //t_printf("Interrupção de relógio");
-  if (cpue_modo(self->cpue) == zumbi){
+  t_printf("Interrupção de relógio");
+  if (cpue_modo(self->cpue) == zumbi){  //se a cpu estiver no mode zumbi, verifica os processos e tenta troca
     verif_processos(self);
     troca_processo(self);
-  }
-/*
-  if (self->proc_ini->prox == NULL){ //o processo é o único
     return;
   }
+  //não está no modo zumbi, há um processo executando
+  self->proc_exec->tempo_exec += rel_periodo(contr_rel(self->contr));   //aumenta o tempo que ficou executando
+  verif_processos(self);                                                //desbloqueia o que puder de processos
 
-  if (self->proc_exec != NULL){
-    self->proc_exec->est_proc = BLOQ; //força a troca de processo
-    self->proc_exec->motivo_bloq = relogio;
-    self->proc_exec->disp_bloq = -1;
+  if ((self->proc_exec != NULL) && (self->proc_exec->prox == NULL)){  //só há um processo pronto
+    return;
+  } else if (self->proc_exec->tempo_exec >= self->quantum){    //se extrapolou o quantum
+    bloqueia_proc(self, rel, -1);                              //bloqueia o processo atual
+
+    exec_copia_estado(contr_exec(self->contr), self->cpue);     //salva o contexto do proc
+    if ( salva_contexto_proc(self, self->proc_exec) != ERR_OK){
+      panico(self);
+    }
+    troca_processo(self);                                       //faz a troca
+    return;
   }
-  troca_processo(self); //o contexto é restaurado aqui
-*/
-  return;
 }
 
 // houve uma interrupção
