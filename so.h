@@ -13,6 +13,10 @@ typedef struct so_t so_t;
 
 typedef struct proc_t proc_t;
 
+typedef struct metricas_proc metricas_proc;
+
+typedef struct metricas_so metricas_so;
+
 // as chamadas de sistema
 typedef enum {
   SO_LE = 1,       // lê do dispositivo em A; coloca valor lido em X

@@ -1,6 +1,31 @@
 #include "so.h"
 #include "tela.h"
+#include <stdio.h>
 #include <stdlib.h>
+
+struct metricas_proc {
+  //metricas principais
+  int tempo_retorno;          //tempo entre criação e fim
+  int tempo_bloq;             //tempo que passou bloqueado
+  int tempo_exec;             //tempo que passou executando
+  int tempo_pronto;     //tempo que passou no estado pronto
+  int n_bloqs;                //numero de bloqueios por E/S
+  int n_preemp;               //numero de bloqueios por preempção
+  //metricas auxiliares
+  int existe_desde;         //registro do tempo de cpu no momento da criação do proc
+  int bloq_desde;           //momento que bloqueou pela ultima vez
+  int exec_desde;           //momendo que entrou em exec pela ultima vez
+  int pronto_desde;         //momento que desbloqueou pela ultima vez
+};
+
+struct metricas_so {
+  //metricas principais
+  int tempo_total;          //tempo total de exec
+  int tempo_total_exec;     //tempo total em modos usuario ou supervisor
+  int n_int;                //numero de interrupções
+  //metricas auxiliares
+  int exec_desde;           //momento que saiu do modo zumbi pela ultima vez
+};
 
 struct proc_t
 {
@@ -13,7 +38,9 @@ struct proc_t
   int disp_bloq;              // qual disp bloqueou
 
   float tempo_expect;       //tempo esperado da próxima execução
-  float tempo_exec;         //tempo que passou executando
+  float tempo_exec;         //tempo que passou executando desde que recebeu processador
+
+  metricas_proc m_proc;
   
   proc_t* prox;
 };
@@ -28,7 +55,9 @@ struct so_t {
   proc_t* proc_prt;     // inicio da fila de processos prontos
 
   int quantum;                        //quantum
-  int (*esc_ptr) (so_t*, proc_t**);  //ponteiro para o escalonador 
+  int (*esc_ptr) (so_t*, proc_t**);   //ponteiro para o escalonador 
+
+  metricas_so m_so;
 };
 
 // funções auxiliares
@@ -36,7 +65,10 @@ static void init_mem(so_t *self);
 static void init_mem_p1(so_t *self, mem_t* mem_p1);
 static void init_mem_p2(so_t *self, mem_t* mem_p2);
 static void panico(so_t *self);
+static void salva_metricas_proc(proc_t* proc);
+static void salva_metricas_so(so_t* so);
 
+//################################################ FUNÇÕES DE TROCA DE CONTEXTO #######################################
 err_t salva_contexto_proc(so_t *self, proc_t* proc)
 {
   //salva na tabela o contexto do processador
@@ -77,6 +109,82 @@ err_t restaura_contexto_proc(so_t* self, proc_t* proc){
   return ERR_OK;
 }
 
+//################################################ FUNÇÕES DE ESTADO DE PROCESSO #######################################
+
+void desbloqueia_proc(so_t* self, proc_t* proc){
+  //debug
+  t_printf("Desbloqueando proc %d", proc->id_proc);
+  //metricas
+  proc->m_proc.tempo_bloq += rel_agora(contr_rel(self->contr)) - proc->m_proc.bloq_desde;
+  proc->m_proc.pronto_desde = rel_agora(contr_rel(self->contr));
+
+  proc->est_proc = PRONTO;
+
+  proc_t* aux = self->proc_prt;
+  if (aux == NULL){           //fila de prontos ta vazia
+    self->proc_prt = proc;
+  }
+  if (aux != NULL){
+    while (aux->prox != NULL){
+      aux = aux->prox;
+    }                         //aux = fim da fila de prontos
+    aux->prox = proc;         //coloca o processo desbloq no fim da fila de prontos
+  } 
+
+  proc_t* aux2 = self->proc_bloq;
+  if (aux2->id_proc == proc->id_proc) {       //o processo que desbloqueou é o primeiro da fila
+    self->proc_bloq = self->proc_bloq->prox;  //retira o processo da fila de bloqueados
+  } else {
+    while ((aux2->prox != NULL) && (aux2->prox->id_proc != proc->id_proc)){
+      aux2 = aux2->prox;
+    }
+    aux2->prox = aux2->prox->prox;
+  }
+
+  proc->prox = NULL;
+}
+
+void bloqueia_proc(so_t* self, proc_bloq_t motivo, int disp){
+  //debug
+  t_printf("Bloqueando proc %d", self->proc_exec->id_proc);
+  //metricas 
+  self->proc_exec->m_proc.tempo_exec += rel_agora(contr_rel(self->contr)) - self->proc_exec->m_proc.exec_desde;
+  self->proc_exec->m_proc.bloq_desde = rel_agora(contr_rel(self->contr));
+  self->proc_exec->m_proc.n_bloqs++;
+
+  self->proc_exec->est_proc = BLOQ;     
+  self->proc_exec->motivo_bloq = motivo;    //guarda o motivo do bloqueio
+  self->proc_exec->disp_bloq = disp;        //guarda qual disp bloqueou
+
+  self->proc_exec->tempo_expect += self->proc_exec->tempo_exec;
+  self->proc_exec->tempo_expect /= 2;
+  self->proc_exec->tempo_exec = 0.0;          //zera o tempo em que executou
+
+  proc_t* aux = self->proc_bloq;
+  if (aux == NULL) {                        //fila de bloqueados esta vazia
+    self->proc_bloq = self->proc_exec;      //coloca o processo bloquado na fila 
+  } else {
+    while(aux->prox != NULL){
+      aux = aux->prox;
+    }
+    aux->prox = self->proc_exec;          //coloca o processo que bloqueou no fim da fila de bloqueados
+  }
+
+  proc_t* aux2 = self->proc_prt;
+  if (aux2 == self->proc_exec) {            //o processo que bloqueou é o primeiro da fila
+    self->proc_prt = self->proc_prt->prox;  //retira o processo da fila de prontos
+  } else {
+    while ((aux2->prox != NULL) && (aux2->prox->id_proc != self->proc_exec->id_proc)){
+      aux2 = aux2->prox;
+    }
+    aux2->prox = aux2->prox->prox;
+  }
+
+  self->proc_exec->prox = NULL;
+}
+
+//################################################ ESCALONADORES #######################################
+
 int escalonador_curto(so_t *self, proc_t** novo){
   //debug
   t_printf("Chamado escalonador mais curto");
@@ -113,10 +221,12 @@ int escalonador_round(so_t *self, proc_t** novo)
     return 0;
   }
   else {
-    *novo = self->proc_prt;
+    *novo = self->proc_prt;       //simplesmente pega o primeiro da fila
     return 1;
   }
 }
+
+//################################################ FUNÇÕES DE ESCALONAMENTO #######################################
 
 void troca_processo(so_t* self){
   proc_t* novo = NULL;
@@ -132,12 +242,25 @@ void troca_processo(so_t* self){
 */
   if (esc == -1) { //acabaram os processos
     self->proc_exec = NULL;
+
+    //atualiza as metricas
+    if (cpue_modo(self->cpue) != zumbi){  //a cpu estava executando
+      self->m_so.tempo_total_exec += rel_agora(contr_rel(self->contr)) - self->m_so.exec_desde;
+    }
+    self->m_so.tempo_total = rel_agora(contr_rel(self->contr));
+
     t_printf("Fim da execução.");
     panico(self);
     return;
 
   } else if (esc == 0) { //todos bloqueados
     self->proc_exec = NULL;
+
+    //atualiza metricas
+    if (cpue_modo(self->cpue) != zumbi){    //cpu está entrando em modo zumbi
+      self->m_so.tempo_total_exec += rel_agora(contr_rel(self->contr)) - self->m_so.exec_desde;
+    }
+
     cpue_muda_modo(self->cpue, zumbi);
     cpue_muda_erro(self->cpue, ERR_OK, 0);
     exec_altera_estado(contr_exec(self->contr), self->cpue);
@@ -145,41 +268,20 @@ void troca_processo(so_t* self){
 
   } else if (esc == 1) { //achou processo
     self->proc_exec = novo;
+
+    //metricas
+    self->proc_exec->m_proc.tempo_pronto += rel_agora(contr_rel(self->contr)) - self->proc_exec->m_proc.pronto_desde;
+    self->proc_exec->m_proc.exec_desde = rel_agora(contr_rel(self->contr));
+    if (cpue_modo(self->cpue) == zumbi){    //cpu esta saindo do modo zumbi 
+      self->m_so.exec_desde = rel_agora(contr_rel(self->contr));
+    }
+
     restaura_contexto_proc(self, self->proc_exec);
     cpue_muda_modo(self->cpue, usuario);
     cpue_muda_erro(self->cpue, ERR_OK, 0);
     exec_altera_estado(contr_exec(self->contr), self->cpue);
     return;
   }
-}
-
-void desbloqueia_proc(so_t* self, proc_t* proc){
-  t_printf("Desbloqueando proc %d", proc->id_proc);
-
-  proc->est_proc = PRONTO;
-
-  proc_t* aux = self->proc_prt;
-  if (aux == NULL){           //fila de prontos ta vazia
-    self->proc_prt = proc;
-  }
-  if (aux != NULL){
-    while (aux->prox != NULL){
-      aux = aux->prox;
-    }                         //aux = fim da fila de prontos
-    aux->prox = proc;         //coloca o processo desbloq no fim da fila de prontos
-  } 
-
-  proc_t* aux2 = self->proc_bloq;
-  if (aux2->id_proc == proc->id_proc) {       //o processo que desbloqueou é o primeiro da fila
-    self->proc_bloq = self->proc_bloq->prox;  //retira o processo da fila de bloqueados
-  } else {
-    while ((aux2->prox != NULL) && (aux2->prox->id_proc != proc->id_proc)){
-      aux2 = aux2->prox;
-    }
-    aux2->prox = aux2->prox->prox;
-  }
-
-  proc->prox = NULL;
 }
 
 void verif_processos(so_t *self)
@@ -200,6 +302,8 @@ void verif_processos(so_t *self)
   }
 }
 
+//################################################ FUNÇÕES DE CRIAÇÃO E INICIALIZAÇÃO #######################################
+
 proc_t* novo_proc(so_t* self, int id)
 {
   proc_t* novo = malloc(sizeof(*novo));
@@ -214,42 +318,11 @@ proc_t* novo_proc(so_t* self, int id)
   novo->tempo_expect = self->quantum;
   novo->tempo_exec = 0.0;
 
+  novo->m_proc = (metricas_proc){0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
   novo->prox = NULL;
 
   return novo;
-}
-
-void bloqueia_proc(so_t* self, proc_bloq_t motivo, int disp){
-  t_printf("Bloqueando proc %d", self->proc_exec->id_proc);
-  self->proc_exec->est_proc = BLOQ;     
-  self->proc_exec->motivo_bloq = motivo;    //guarda o motivo do bloqueio
-  self->proc_exec->disp_bloq = disp;        //guarda qual disp bloqueou
-
-  self->proc_exec->tempo_expect += self->proc_exec->tempo_exec;
-  self->proc_exec->tempo_expect /= 2;
-  self->proc_exec->tempo_exec = 0.0;          //zera o tempo em que executou
-
-  proc_t* aux = self->proc_bloq;
-  if (aux == NULL) {                        //fila de bloqueados esta vazia
-    self->proc_bloq = self->proc_exec;      //coloca o processo bloquado na fila 
-  } else {
-    while(aux->prox != NULL){
-      aux = aux->prox;
-    }
-    aux->prox = self->proc_exec;          //coloca o processo que bloqueou no fim da fila de bloqueados
-  }
-
-  proc_t* aux2 = self->proc_prt;
-  if (aux2 == self->proc_exec) {            //o processo que bloqueou é o primeiro da fila
-    self->proc_prt = self->proc_prt->prox;  //retira o processo da fila de prontos
-  } else {
-    while ((aux2->prox != NULL) && (aux2->prox->id_proc != self->proc_exec->id_proc)){
-      aux2 = aux2->prox;
-    }
-    aux2->prox = aux2->prox->prox;
-  }
-
-  self->proc_exec->prox = NULL;
 }
 
 so_t *so_cria(contr_t *contr)
@@ -266,12 +339,14 @@ so_t *so_cria(contr_t *contr)
   self->proc_exec = self->proc_prt;
 
   //aqui escolhe entre um quantum grande e um pequeno
-  self->quantum = 15;      //quantum grande
-  //self->quantum = 6;       //quantum pequeno
+  //self->quantum = 15;      //quantum grande
+  self->quantum = 6;       //quantum pequeno
 
   //aqui escolhe qual escalonador será usado
-  //self->esc_ptr = &escalonador_round;     //escalonador circular
-  self->esc_ptr = &escalonador_curto;     //escalonador que escolhe o mais rápido
+  self->esc_ptr = &escalonador_round;     //escalonador circular
+  //self->esc_ptr = &escalonador_curto;     //escalonador que escolhe o mais rápido
+
+  self->m_so = (metricas_so){0, 0, 0, 0};
 
   init_mem(self);
   // coloca a CPU em modo usuário
@@ -283,13 +358,21 @@ so_t *so_cria(contr_t *contr)
   return self;
 }
 
+//################################################ FUNÇÕES DE DESTRUIÇÃO #######################################
+
 void so_destroi(so_t *self)
 {
   cpue_destroi(self->cpue);
   free(self);
 }
 
-// trata chamadas de sistema
+void destroi_proc(proc_t* proc){
+  cpue_destroi(proc->cpue_proc);
+  mem_destroi(proc->mem_proc);
+  free(proc);
+}
+
+//################################################ TRATAMENTO DE SISOPS #######################################
 
 // chamada de sistema para leitura de E/S
 // recebe em A a identificação do dispositivo
@@ -349,24 +432,22 @@ static void so_trata_sisop_escr(so_t *self)
 // chamada de sistema para término do processo
 static void so_trata_sisop_fim(so_t *self)
 {
+  //metricas
+  self->proc_exec->m_proc.tempo_retorno = rel_agora(contr_rel(self->contr)) - self->proc_exec->m_proc.existe_desde;
+  salva_metricas_proc(self->proc_exec);
+
   proc_t* aux = self->proc_prt;
-
-  if (self->proc_prt == self->proc_exec){ //o processo a ser destruido é o primeiro da lista de prontos
+  if (self->proc_prt == self->proc_exec) { //o processo a ser destruido é o primeiro da lista de prontos
     self->proc_prt = self->proc_prt->prox;
+    destroi_proc(self->proc_exec);
 
-    cpue_destroi(self->proc_exec->cpue_proc);
-    mem_destroi(self->proc_exec->mem_proc);
-    free(self->proc_exec);
-  
   } else {
     while( (aux->prox != NULL) && (aux->prox->id_proc != self->proc_exec->id_proc) ){
       aux = aux->prox;
     } //agora o aux aponta pro anterior ao atual
-    aux->prox = self->proc_exec->prox;
 
-    cpue_destroi(self->proc_exec->cpue_proc);
-    mem_destroi(self->proc_exec->mem_proc);
-    free(self->proc_exec);
+    aux->prox = self->proc_exec->prox;
+    destroi_proc(self->proc_exec);
   }
   self->proc_exec = NULL;
   cpue_muda_erro(self->cpue, ERR_OK, 0);
@@ -377,6 +458,9 @@ static void so_trata_sisop_cria(so_t *self)
 {
   int id = cpue_A(self->cpue);
   proc_t* novo = novo_proc(self, id);
+
+  //guarda o valor do rel no momento da criação
+  novo->m_proc.existe_desde = rel_agora(contr_rel(self->contr));
 
   proc_t* aux = self->proc_prt;
   while(aux->prox != NULL){
@@ -430,7 +514,7 @@ static void so_trata_tic(so_t *self)
 {
   //debug
   t_printf("Interrupção de relógio");
-  if (cpue_modo(self->cpue) == zumbi){  //se a cpu estiver no mode zumbi, verifica os processos e tenta troca
+  if ((cpue_modo(self->cpue) == zumbi) || (self->proc_exec == NULL)){   //se a cpu estiver no mode zumbi, verifica os processos e tenta troca
     verif_processos(self);
     troca_processo(self);
     return;
@@ -439,16 +523,19 @@ static void so_trata_tic(so_t *self)
   self->proc_exec->tempo_exec += rel_periodo(contr_rel(self->contr));   //aumenta o tempo que ficou executando
   verif_processos(self);                                                //desbloqueia o que puder de processos
 
-  if ((self->proc_exec != NULL) && (self->proc_exec->prox == NULL)){  //só há um processo pronto
+  if (self->proc_exec->prox == NULL){                                //só há um processo pronto
     return;
-  } else if (self->proc_exec->tempo_exec >= self->quantum){    //se extrapolou o quantum
-    bloqueia_proc(self, rel, -1);                              //bloqueia o processo atual
+  } else if (self->proc_exec->tempo_exec >= self->quantum){         //se extrapolou o quantum
+    //metricas
+    self->proc_exec->m_proc.n_preemp++;
 
-    exec_copia_estado(contr_exec(self->contr), self->cpue);     //salva o contexto do proc
+    //preempção
+    bloqueia_proc(self, rel, -1);                                   //bloqueia o processo atual
+    exec_copia_estado(contr_exec(self->contr), self->cpue);         //salva o contexto do proc
     if ( salva_contexto_proc(self, self->proc_exec) != ERR_OK){
       panico(self);
-    }
-    troca_processo(self);                                       //faz a troca
+    }    
+    troca_processo(self);                                           //fa z a troca
     return;
   }
 }
@@ -456,6 +543,8 @@ static void so_trata_tic(so_t *self)
 // houve uma interrupção
 void so_int(so_t *self, err_t err)
 {
+  self->m_so.n_int++;
+
   switch (err) {
     case ERR_SISOP:
       so_trata_sisop(self);     // ERR_OK se ta tudo bem, ERR_OCUP se deu ruim
@@ -484,11 +573,21 @@ void so_int(so_t *self, err_t err)
   }
 }
 
+//################################################ FUNÇÕES DE CONTROLE #######################################
 // retorna false se o sistema deve ser desligado
 bool so_ok(so_t *self)
 {
   return !self->paniquei;
 }
+
+static void panico(so_t *self) 
+{
+  t_printf("Problema irrecuperável no SO");
+  self->paniquei = true;
+  salva_metricas_so(self);
+}
+
+//################################################ FUNÇÕES DE INICIALIZAÇÃO DE MEM #######################################
 
 static void init_mem_p1(so_t* self, mem_t* mem_p1){
   int p1[] = {
@@ -537,9 +636,77 @@ static void init_mem(so_t *self)
     }
   }
 }
-  
-static void panico(so_t *self) 
-{
-  t_printf("Problema irrecuperável no SO");
-  self->paniquei = true;
+
+//################################################ FUNÇÕES EXTRAS #######################################
+
+static void salva_metricas_proc(proc_t* proc){
+  FILE* file;
+
+  if (proc->id_proc == 0){    //esse é o processo 0, reinicia o arquivo
+    file = fopen("proc_metricas.txt", "w");
+  } else {                    //não é o processo 0, abre o arquivo no modo 'append'
+    file = fopen("proc_metricas.txt", "a");
+  }
+
+  if (file == NULL){
+    t_printf("Não foi possível salvar dados do processo.");
+    return;
+  }
+  char s[8][32] = {
+    "Id do processo:       ",
+    "Tempo de retorno:     ",
+    "Tempo bloqueado:      ",
+    "Tempo em execução:    ",
+    "Tempo esperando:      ",
+    "Número de bloqueios:  ",
+    "Número de preempções: ",
+    "Métricas coletadas do processo"
+  };
+
+  int d[7] = {
+    proc->id_proc, 
+    proc->m_proc.tempo_retorno, 
+    proc->m_proc.tempo_bloq, 
+    proc->m_proc.tempo_exec, 
+    proc->m_proc.tempo_pronto, 
+    proc->m_proc.n_bloqs, 
+    proc->m_proc.n_preemp
+  };
+
+  fprintf(file, "%s\n%s %d\n%s %d\n%s %d\n%s %d\n%s %d\n%s %d\n%s %d\n\n\n", s[7],
+          s[0], d[0], 
+          s[1], d[1],
+          s[2], d[2],
+          s[3], d[3],
+          s[4], d[4],
+          s[5], d[5],
+          s[6], d[6]);
+  fclose(file);
+}
+
+static void salva_metricas_so(so_t* so){
+  FILE* file = fopen("so_metricas.txt", "w");
+
+  if (file == NULL){
+    t_printf("Não foi possível salvar dados do SO.");
+    return;
+  }
+  char s[4][38] = {
+    "Tempo total de sistema:  ",
+    "Tempo total em execução: ",
+    "Número de interrupções:  ",
+    "Métricas do Sistema Operacional"
+  };
+
+  int d[7] = {
+    so->m_so.tempo_total, 
+    so->m_so.tempo_total_exec,
+    so->m_so.n_int 
+  };
+
+  fprintf(file, "%s\n%s %d\n%s %d\n%s %d\n\n", s[3], 
+          s[0], d[0], 
+          s[1], d[1],
+          s[2], d[2]);
+  fclose(file);
 }
