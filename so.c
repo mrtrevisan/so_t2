@@ -2,6 +2,7 @@
 #include "tela.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 struct metricas_proc {
   //metricas principais
@@ -56,6 +57,7 @@ struct so_t {
 
   int quantum;                        //quantum
   int (*esc_ptr) (so_t*, proc_t**);   //ponteiro para o escalonador 
+  char escal[16];                     //nome do escalonador
 
   metricas_so m_so;
 };
@@ -339,12 +341,17 @@ so_t *so_cria(contr_t *contr)
   self->proc_exec = self->proc_prt;
 
   //aqui escolhe entre um quantum grande e um pequeno
-  //self->quantum = 15;      //quantum grande
-  self->quantum = 6;       //quantum pequeno
+
+  self->quantum = 15;      //quantum grande
+  //self->quantum = 6;       //quantum pequeno
 
   //aqui escolhe qual escalonador será usado
-  self->esc_ptr = &escalonador_round;     //escalonador circular
-  //self->esc_ptr = &escalonador_curto;     //escalonador que escolhe o mais rápido
+
+  //self->esc_ptr = &escalonador_round;     //escalonador circular
+  //strcpy(self->escal, "primeiro-pronto");
+
+  self->esc_ptr = &escalonador_curto;     //escalonador que escolhe o mais rápido
+  strcpy(self->escal, "mais-curto");
 
   self->m_so = (metricas_so){0, 0, 0, 0};
 
@@ -643,9 +650,9 @@ static void salva_metricas_proc(proc_t* proc){
   FILE* file;
 
   if (proc->id_proc == 0){    //esse é o processo 0, reinicia o arquivo
-    file = fopen("proc_metricas.txt", "w");
+    file = fopen("metricas.txt", "w");
   } else {                    //não é o processo 0, abre o arquivo no modo 'append'
-    file = fopen("proc_metricas.txt", "a");
+    file = fopen("metricas.txt", "a");
   }
 
   if (file == NULL){
@@ -685,28 +692,33 @@ static void salva_metricas_proc(proc_t* proc){
 }
 
 static void salva_metricas_so(so_t* so){
-  FILE* file = fopen("so_metricas.txt", "w");
+  FILE* file = fopen("metricas.txt", "a");
 
   if (file == NULL){
     t_printf("Não foi possível salvar dados do SO.");
     return;
   }
-  char s[4][38] = {
+  char s[6][38] = {
+    "Quantum:                 ",
+    "Escalonador:             ",
     "Tempo total de sistema:  ",
     "Tempo total em execução: ",
     "Número de interrupções:  ",
     "Métricas do Sistema Operacional"
   };
 
-  int d[7] = {
+  int d[4] = {
+    so->quantum,
     so->m_so.tempo_total, 
     so->m_so.tempo_total_exec,
     so->m_so.n_int 
   };
 
-  fprintf(file, "%s\n%s %d\n%s %d\n%s %d\n\n", s[3], 
+  fprintf(file, "%s\n%s %d\n%s %s\n%s %d\n%s %d\n%s %d\n\n", s[5], 
           s[0], d[0], 
-          s[1], d[1],
-          s[2], d[2]);
+          s[1], (so->escal),
+          s[2], d[1],
+          s[3], d[2],
+          s[4], d[3]);
   fclose(file);
 }
